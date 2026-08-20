@@ -51,7 +51,6 @@ def feature_encoder_transform(X, state):
         dummies = pd.get_dummies(X[cat_cols], prefix_sep='__')
         X = X.drop(columns=cat_cols)
         X = pd.concat([X, dummies], axis=1)
-
         X = X.reindex(columns=state['output_cols'], fill_value=0)
         return X.values
 
@@ -168,6 +167,17 @@ def sort_indices(dists, algorithm='quick'):
 
     return [idx for _, idx in sort_pairs]
 
+def compute_weights(dists, scheme='uniform', epsilon=1e-10):
+    dists = np.asarray(dists)
+
+    if scheme == 'uniform':
+        return np.ones_like(dists)
+    elif scheme == 'distance':
+
+        return 1.0 / (dists + epsilon)
+    else:
+        raise ValueError(f"Unknown weights scheme: {scheme}")
+
 def knn_fit(X, y, params):
 
     imp_state = imputer_fit(
@@ -208,6 +218,7 @@ def knn_kneighbors(model, X):
     sort_algo = model['params'].get('sort_algorithm', 'quick')
 
     nbrs_list = []
+    dists_list = []
 
     for x in X_enc:
         dists = np.zeros(len(model['Xtr']))
@@ -216,23 +227,34 @@ def knn_kneighbors(model, X):
 
         sort_inds = sort_indices(dists, sort_algo)
         selected = sort_inds[:k]
-        nbrs_list.append(selected)
+        sel_d = dists[selected]
 
-    return np.array(nbrs_list)
+        nbrs_list.append(selected)
+        dists_list.append(sel_d)
+
+    return np.array(nbrs_list), np.array(dists_list)
 
 def knn_predict(model, X):
-    neighbors = knn_kneighbors(model, X)
+    neighbors, dists = knn_kneighbors(model, X)
     ytr = model['ytr']
     classes = model['classes']
     tie_break = model['params'].get('vote_tie_break', 'nearest')
+    w_scheme = model['params'].get('weights', 'uniform')
 
     preds = []
 
-    for nbrs in neighbors:
+    for i, nbrs in enumerate(neighbors):
         labels = ytr[nbrs]
-        counts = np.bincount(labels, minlength=len(classes))
-        max_votes = np.max(counts)
-        tied = np.where(counts == max_votes)[0]
+        d = dists[i]
+
+        weights = compute_weights(d, scheme=w_scheme)
+
+        cw = np.zeros(len(classes))
+        for label, w in zip(labels, weights):
+            cw[label] += w
+
+        mx = np.max(cw)
+        tied = np.where(cw == mx)[0]
 
         if len(tied) == 1:
             pred = tied[0]
@@ -279,26 +301,28 @@ if __name__ == "__main__":
         X, y, test_size=0.3, random_state=42, stratify=y
     )
 
-    for sort_alg in ['bubble', 'merge', 'quick']:
+    for w_scheme in ['uniform', 'distance']:
         params = {
             'n_neighbors': 5,
             'metric': 'euclidean',
-            'p': 2,
-            'sort_algorithm': sort_alg,
+            'sort_algorithm': 'quick',
             'numeric_imputation': 'mean',
             'categorical_imputation': 'mode',
             'categorical_encoding': 'onehot',
-            'vote_tie_break': 'nearest'
+            'vote_tie_break': 'nearest',
+            'weights': w_scheme
         }
 
         model = knn_fit(Xtr, ytr, params)
         preds = knn_predict(model, Xte)
 
         acc = np.mean(preds == yte)
-        print(f"Sorting algorithm: {sort_alg:8s} -> Accuracy: {acc:.4f}")
+        print(f"Weights: {w_scheme:10s} -> Accuracy: {acc:.4f}")
 
+    params['weights'] = 'distance'
+    model_dist = knn_fit(Xtr, ytr, params)
     sample_idx = 0
     sample = Xte.iloc[[sample_idx]]
-    pred = knn_predict(model, sample)
+    pred = knn_predict(model_dist, sample)
     print(f"\nSample true label: {yte.iloc[sample_idx]}")
-    print(f"Predicted label  : {pred[0]}")
+    print(f"Predicted label (distance weighting): {pred[0]}")
